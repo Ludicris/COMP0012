@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.util.Iterator;
 import java.util.Stack;
 import java.util.HashMap;
+import java.util.List;
+import java.util.ArrayList;
 
 import org.apache.bcel.classfile.ClassParser;
 import org.apache.bcel.classfile.Code;
@@ -31,6 +33,11 @@ public class ConstantFolder
 	HashMap<Integer, Number> variableMap = null; // store variable index and constant in that variable
 
 	Stack<InstructionHandle> pushAndLoadInstructions = null; // store all push and load instructions
+
+	List<InstructionHandle> loopInstructions = null;
+
+	boolean deleteBranch;
+	boolean ifLoop;
 
 	public ConstantFolder(String classFilePath)
 	{
@@ -79,6 +86,8 @@ public class ConstantFolder
 	public void optimize()
 	{
 		ClassGen cgen = new ClassGen(original);
+		cgen.setMajor(50);
+		cgen.setMinor(0);
 		ConstantPoolGen cpgen = cgen.getConstantPool();
 
 		System.out.println("---BEFORE OPTIMISATION---");
@@ -86,7 +95,7 @@ public class ConstantFolder
 		printInstructions(cgen);
 
 		// Implement your optimization here
-		if (classFilePath.contains("ConstantVariableFolding")) {
+		if (true) {
 			System.out.println("Start Optimisation");
 			Method[] methods = cgen.getMethods();
 			for (Method method : methods) {
@@ -94,6 +103,8 @@ public class ConstantFolder
 				constantStack = new Stack<Number>();
 				variableMap = new HashMap<Integer, Number>();
 				pushAndLoadInstructions = new Stack<InstructionHandle>();
+				ifLoop = false;
+				deleteBranch = false;
 				performConstantVariableFolding(cgen, cpgen, method);
 			}
 		}
@@ -101,7 +112,7 @@ public class ConstantFolder
 		System.out.println("---AFTER OPTIMISATION---");
 		printConstants(cpgen);
 		printInstructions(cgen);
-        
+
 		this.optimized = cgen.getJavaClass();
 	}
 
@@ -114,14 +125,27 @@ public class ConstantFolder
 
 		InstructionHandle[] handles = il.getInstructionHandles();
 
+		loopInstructions(il);
 		// iterate through all the instructions and perform optimisation according to their type
 		for (InstructionHandle handle : handles) {
 			Instruction instruction = handle.getInstruction();
+
+			// Arithmetic
 			if (instruction instanceof ArithmeticInstruction) optimiseArithmeticInstruction(il, handle, cpgen);
-			else if (instruction instanceof StoreInstruction) optimiseStoreInstruction(il, handle);
-			else if (instruction instanceof LoadInstruction) optimiseLoadInstruction(il, handle, cpgen);
+			else if (instruction instanceof LCMP) optimiseLongInstruction(il, handle, cpgen);
+			else if (instruction instanceof IfInstruction) optimiseIfComparison(il, handle);
+
+			// GoTo
+			if (instruction instanceof GotoInstruction) optimiseGoToInstruction(il, handle, cpgen);
+
+			// Store
+			if (instruction instanceof StoreInstruction) optimiseStoreInstruction(il, handle);
+
+			// Load
+			if (instruction instanceof LoadInstruction) optimiseLoadInstruction(il, handle, cpgen);
 			else if (isConstantLoadOrPushInstruction(instruction)) optimiseConstantLoadOrPushInstruction(il, handle, cpgen);
 			else if (instruction instanceof ConversionInstruction) optimiseConversionInstruction(il, handle, cpgen);
+			else ifLoop = false;
 		}
 
 		methodGen.setMaxStack();
@@ -130,8 +154,39 @@ public class ConstantFolder
 		cgen.replaceMethod(method, optimisedMethod);
 	}
 
+	public void optimiseLongInstruction(InstructionList il, InstructionHandle handle, ConstantPoolGen cpgen){
+		if (ifLoop) return;
+
+		long first = (Long) constantStack.pop();
+		long second = (Long) constantStack.pop();
+
+		int result = 0;
+		if (first > second) result = 1;
+		else if (first < second) result = -1;
+
+		deleteInstruction(il, pushAndLoadInstructions.pop());
+		deleteInstruction(il, pushAndLoadInstructions.pop());
+		// Load the result into the constant pool
+		Instruction newLoadInstruction = generateNewLoadInstruction(result, cpgen);
+		handle.setInstruction(newLoadInstruction);
+		pushAndLoadInstructions.push(handle);
+		constantStack.push(result);
+
+	}
+
+	public void optimiseGoToInstruction(InstructionList il, InstructionHandle handle, ConstantPoolGen cpgen){
+		if(deleteBranch){
+			deleteBranch = false;
+			GotoInstruction instruction = (GotoInstruction) handle.getInstruction();
+			InstructionHandle target = instruction.getTarget();
+			deleteMultipleInstructions(il, handle, target.getPrev());
+		}
+	}
+
 	public void optimiseArithmeticInstruction(InstructionList il, InstructionHandle handle, ConstantPoolGen cpgen)
 	{
+		if (ifLoop) return;
+
 		System.out.println("---Optimising Arithmetic Instruction---");
 		Instruction instruction = handle.getInstruction();
 		// Calculate the result of arithmetic operation
@@ -158,19 +213,19 @@ public class ConstantFolder
 		else if (operator instanceof IMUL) result = first.intValue() * second.intValue();
 		else if (operator instanceof IDIV) result = first.intValue() / second.intValue();
 
-		// Long Operations
+			// Long Operations
 		else if (operator instanceof LADD) result = first.longValue() + second.longValue();
 		else if (operator instanceof LSUB) result = first.longValue() - second.longValue();
 		else if (operator instanceof LMUL) result = first.longValue() * second.longValue();
 		else if (operator instanceof LDIV) result = first.longValue() / second.longValue();
 
-		// Float Operations
+			// Float Operations
 		else if (operator instanceof FADD) result = first.floatValue() + second.floatValue();
 		else if (operator instanceof FSUB) result = first.floatValue() - second.floatValue();
 		else if (operator instanceof FMUL) result = first.floatValue() * second.floatValue();
 		else if (operator instanceof FDIV) result = first.floatValue() / second.floatValue();
 
-		// Double Operations
+			// Double Operations
 		else if (operator instanceof DADD) result = first.doubleValue() + second.doubleValue();
 		else if (operator instanceof DSUB) result = first.doubleValue() - second.doubleValue();
 		else if (operator instanceof DMUL) result = first.doubleValue() * second.doubleValue();
@@ -180,6 +235,59 @@ public class ConstantFolder
 
 		return result;
 	}
+	public void optimiseIfComparison(InstructionList il, InstructionHandle handle){
+		if(ifLoop) return;
+
+		IfInstruction instruction = (IfInstruction) handle.getInstruction();
+
+		if(getComparison(il, instruction)){
+			deleteInstruction(il, handle);
+			deleteBranch = true;
+		} else{
+			// False outcome, no need for any of the instructions within the loop
+			InstructionHandle target = instruction.getTarget();
+			deleteMultipleInstructions(il, handle, target.getPrev());
+		}
+	}
+	private static boolean performComparisonOperationWithZero(Number first, Instruction instruction){
+		if (instruction instanceof IFLE) return first.intValue() <= 0;
+		else if (instruction instanceof  IFEQ) return first.intValue() == 0;
+		else if (instruction instanceof  IFGT) return first.intValue() > 0;
+		else if (instruction instanceof  IFLT) return first.intValue() < 0;
+		else if (instruction instanceof  IFNE) return first.intValue() != 0;
+		else if (instruction instanceof  IFGE) return first.intValue() >= 0;
+		else throw new IllegalArgumentException("Invalid instruction for comparison");
+	}
+
+	private static boolean performComparisonOperation(Number first, Number second, Instruction instruction){
+
+		if (instruction instanceof IF_ICMPLE) return first.intValue() <= second.intValue();
+		else if (instruction instanceof IF_ICMPEQ) return first.intValue() == second.intValue();
+		else if (instruction instanceof IF_ICMPGT) return first.intValue() > second.intValue();
+		else if (instruction instanceof IF_ICMPLT) return first.intValue() < second.intValue();
+		else if (instruction instanceof IF_ICMPNE) return first.intValue() != second.intValue();
+		else if (instruction instanceof  IF_ICMPGE) return first.intValue() >= second.intValue();
+		else throw new IllegalArgumentException("Invalid instruction for comparison");
+	}
+
+	private static boolean zeroComparison(Instruction instruction){
+		return instruction instanceof IFLE || instruction instanceof IFLT || instruction instanceof IFGE ||
+				instruction instanceof IFGT || instruction instanceof IFEQ || instruction instanceof IFNE;
+	}
+
+	private boolean getComparison(InstructionList instructionList, IfInstruction instruction){
+		if (zeroComparison(instruction)){
+			// If comparing with 0 (we are only popping one instruction)
+			deleteInstruction(instructionList, pushAndLoadInstructions.pop());
+			return performComparisonOperationWithZero(constantStack.pop(), instruction);
+		}
+		Number first = constantStack.pop();
+		Number second = constantStack.pop();
+		deleteInstruction(instructionList, pushAndLoadInstructions.pop());
+		deleteInstruction(instructionList, pushAndLoadInstructions.pop());
+		return performComparisonOperation(first, second, instruction);
+	}
+
 
 	public void optimiseStoreInstruction(InstructionList il, InstructionHandle handle)
 	{
@@ -201,6 +309,7 @@ public class ConstantFolder
 			Number value = variableMap.get(key);
 			constantStack.push(value);
 			pushAndLoadInstructions.push(handle);
+			ifLoop = ifLoop || checkLoopVariable(handle, key);
 		}
 	}
 
@@ -265,26 +374,28 @@ public class ConstantFolder
 
 	public void optimiseConversionInstruction (InstructionList il, InstructionHandle handle, ConstantPoolGen cpgen)
 	{
-		Instruction instruction = handle.getInstruction();
-		boolean toIntegerInstruction = instruction instanceof L2I || instruction instanceof F2I || instruction instanceof D2I;
-		boolean toLongInstruction = instruction instanceof I2L || instruction instanceof F2L || instruction instanceof D2L;
-		boolean toFloatInstruction = instruction instanceof I2F || instruction instanceof L2F || instruction instanceof D2F;
-		boolean toDoubleInstruction = instruction instanceof I2D || instruction instanceof L2D || instruction instanceof F2D;
+		if (isConstantLoadOrPushInstruction(pushAndLoadInstructions.peek().getInstruction()) || !ifLoop){
+			Instruction instruction = handle.getInstruction();
+			boolean toIntegerInstruction = instruction instanceof L2I || instruction instanceof F2I || instruction instanceof D2I;
+			boolean toLongInstruction = instruction instanceof I2L || instruction instanceof F2L || instruction instanceof D2L;
+			boolean toFloatInstruction = instruction instanceof I2F || instruction instanceof L2F || instruction instanceof D2F;
+			boolean toDoubleInstruction = instruction instanceof I2D || instruction instanceof L2D || instruction instanceof F2D;
 
-		Number value = constantStack.pop();
-		Number convertedValue = null;
-		if (toIntegerInstruction) convertedValue = value.intValue();
-		else if (toLongInstruction) convertedValue = value.longValue();
-		else if (toFloatInstruction) convertedValue = value.floatValue();
-		else if (toDoubleInstruction) convertedValue = value.doubleValue();
+			Number value = constantStack.pop();
+			Number convertedValue = null;
+			if (toIntegerInstruction) convertedValue = value.intValue();
+			else if (toLongInstruction) convertedValue = value.longValue();
+			else if (toFloatInstruction) convertedValue = value.floatValue();
+			else if (toDoubleInstruction) convertedValue = value.doubleValue();
 
-		constantStack.push(convertedValue);
-		deleteInstruction(il, pushAndLoadInstructions.pop());
-		Number finalValue = constantStack.peek();
-		// Load the result into the constant pool
-		Instruction newLoadInstruction = generateNewLoadInstruction(finalValue, cpgen);
-		handle.setInstruction(newLoadInstruction);
-		pushAndLoadInstructions.push(handle);
+			constantStack.push(convertedValue);
+			deleteInstruction(il, pushAndLoadInstructions.pop());
+			Number finalValue = constantStack.peek();
+			// Load the result into the constant pool
+			Instruction newLoadInstruction = generateNewLoadInstruction(finalValue, cpgen);
+			handle.setInstruction(newLoadInstruction);
+			pushAndLoadInstructions.push(handle);
+		}
 	}
 
 	public void deleteInstruction(InstructionList il, InstructionHandle handle)
@@ -304,7 +415,55 @@ public class ConstantFolder
 			}
 		}
 	}
-	
+
+	public void deleteMultipleInstructions(InstructionList il, InstructionHandle handle, InstructionHandle targetHandle){
+		try{
+			il.delete(handle, targetHandle);
+		} catch (TargetLostException e) { }
+	}
+
+	public void loopInstructions(InstructionList instructionList) {
+		loopInstructions = new ArrayList<InstructionHandle>();
+		for(InstructionHandle handle : instructionList.getInstructionHandles()){
+			if(handle.getInstruction() instanceof GotoInstruction){
+				GotoInstruction instruction = (GotoInstruction) handle.getInstruction();
+
+				if(instruction.getTarget().getPosition() < handle.getPosition()){
+					loopInstructions.add(instruction.getTarget());
+					loopInstructions.add(handle);
+				}
+			}
+		}
+	}
+
+	public InstructionHandle getLoopLocations(InstructionHandle handle){
+		int pos = handle.getPosition();
+		for(int start = 0; start < loopInstructions.size(); start += 2){ // We store start, end thus increment by 2 to get next pairing
+			InstructionHandle startInstruction = loopInstructions.get(start);
+			InstructionHandle endInstruction = loopInstructions.get(start+1);
+
+			if (pos >= startInstruction.getPosition() && pos < endInstruction.getPosition()){
+				return startInstruction;
+			}
+		}
+		return null;
+	}
+
+	public boolean checkLoopVariable(InstructionHandle handle, int index){
+		InstructionHandle loopHandle = getLoopLocations(handle);
+
+		while(loopHandle != null && !(loopHandle.getInstruction() instanceof GotoInstruction)){ // means we are at end of loop
+			Instruction instruction = loopHandle.getInstruction();
+			if(instruction instanceof StoreInstruction) {
+				if (((StoreInstruction) instruction).getIndex() == index) return true; // check if the variable of position (index) is being changed
+			} else if(instruction instanceof  IINC){
+				if (((IINC) instruction).getIndex() == index) return true;
+			}
+			loopHandle = loopHandle.getNext();
+		}
+		return false;
+	}
+
 	public void write(String optimisedFilePath)
 	{
 		this.optimize();
