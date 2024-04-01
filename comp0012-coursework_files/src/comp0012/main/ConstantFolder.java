@@ -444,8 +444,9 @@ public class ConstantFolder
 	public boolean checkLoopVariable(InstructionHandle handle, int index)
 	{
 		InstructionHandle loopHandle = findStartOfLoopForInstruction(handle);
-		Instruction instruction = loopHandle.getInstruction();
-		while(loopHandle != null && !(instruction instanceof GotoInstruction)){ // goto means we are at end of loop
+
+		while(loopHandle != null && !(loopHandle.getInstruction() instanceof GotoInstruction)){ // goto means we are at end of loop
+			Instruction instruction = loopHandle.getInstruction();
 			if(instruction instanceof StoreInstruction && ((StoreInstruction) instruction).getIndex() == index) {
 				return true; // check if the variable of position (index) is being changed
 			} else if(instruction instanceof IINC && ((IINC) instruction).getIndex() == index){
