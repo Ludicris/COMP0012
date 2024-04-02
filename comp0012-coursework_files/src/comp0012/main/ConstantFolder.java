@@ -141,8 +141,24 @@ public class ConstantFolder
 		methodGen.setMaxStack();
 		methodGen.setMaxLocals();
 		Method optimisedMethod = methodGen.getMethod();
-		Method method1 = removeDeadCode(cgen, cpgen , optimisedMethod);
-		cgen.replaceMethod(method, method1);
+		Method cleanCodeMethod = removeDeadCode(cgen, cpgen , optimisedMethod);
+		cgen.replaceMethod(method, cleanCodeMethod);
+	}
+
+	public void findVariableRefcounts(InstructionList il){
+		InstructionHandle[] handles = il.getInstructionHandles();
+
+		for (InstructionHandle handle: handles){
+			Instruction instruction = handle.getInstruction();
+			if (instruction instanceof StoreInstruction){
+				int key = ((StoreInstruction) instruction).getIndex();
+				variableRefcount.put(key, 1);
+			}
+			else if (instruction instanceof LoadInstruction && !(instruction instanceof ALOAD) ){
+				int key = ((LoadInstruction) instruction).getIndex();
+				variableRefcount.put(key, variableRefcount.get(key) + 1);
+			}
+		}
 	}
 
 	public Method removeDeadCode(ClassGen cgen, ConstantPoolGen cpgen, Method method){
@@ -153,18 +169,8 @@ public class ConstantFolder
 		InstructionHandle[] handles = il.getInstructionHandles();
 
 		findLoopPositions(il);
-		//first forward pass
-		for (InstructionHandle handle: handles){
-			Instruction instruction = handle.getInstruction();
-			if (instruction instanceof StoreInstruction){
-				int key = ((StoreInstruction) instruction).getIndex();
-					variableRefcount.put(key, 1);
-			}
-			else if (instruction instanceof LoadInstruction && !(instruction instanceof ALOAD) ){
-				 int key = ((LoadInstruction) instruction).getIndex();
-				 variableRefcount.put(key, variableRefcount.get(key) + 1);
-			}
-		}
+		//Count the number of times each variable is referenced
+		findVariableRefcounts(il);
 
 		//iterate through instructions and if refcount is 1 then pop previous two instructions.
 		for (InstructionHandle handle: handles){
@@ -176,8 +182,12 @@ public class ConstantFolder
 					deleteInstruction(il,prev);
 					deleteInstruction(il,handle);
 				}
-			} else if (isConstantLoadOrPushInstruction(instruction)) {
+			}
+			else if (isConstantLoadOrPushInstruction(instruction)) {
 				pushAndLoadInstructions.push(handle);
+			}
+			else{
+				continue;
 			}
 		}
 
