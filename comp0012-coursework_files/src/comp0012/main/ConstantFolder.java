@@ -3,10 +3,7 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.util.Stack;
-import java.util.HashMap;
-import java.util.List;
-import java.util.ArrayList;
+import java.util.*;
 
 import org.apache.bcel.classfile.ClassParser;
 import org.apache.bcel.classfile.JavaClass;
@@ -31,6 +28,8 @@ public class ConstantFolder
 	Stack<InstructionHandle> pushAndLoadInstructions = null; // store all push and load instructions
 
 	List<InstructionHandle> loopPositions = null; // store the start and end of loops
+
+	HashMap<Integer, Integer> variableRefcount = null;
 
 	boolean deleteElse;
 	boolean ifInLoop;
@@ -95,10 +94,12 @@ public class ConstantFolder
 		Method[] methods = cgen.getMethods();
 		for (Method method : methods) {
 			// initialize data structure for every method
+			System.out.println("Method Name:" + method.getName());
 			constantStack = new Stack<Number>();
 			variableMap = new HashMap<Integer, Number>();
 			pushAndLoadInstructions = new Stack<InstructionHandle>();
 			loopPositions = new ArrayList<InstructionHandle>();
+			variableRefcount = new HashMap<Integer, Integer>();
 			ifInLoop = false;
 			deleteElse = false;
 			performConstantFoldingOptimisation(cgen, cpgen, method);
@@ -140,7 +141,60 @@ public class ConstantFolder
 		methodGen.setMaxStack();
 		methodGen.setMaxLocals();
 		Method optimisedMethod = methodGen.getMethod();
-		cgen.replaceMethod(method, optimisedMethod);
+		Method cleanCodeMethod = removeDeadCode(cgen, cpgen , optimisedMethod);
+		cgen.replaceMethod(method, cleanCodeMethod);
+	}
+
+	public void findVariableRefcounts(InstructionList il){
+		InstructionHandle[] handles = il.getInstructionHandles();
+
+		for (InstructionHandle handle: handles){
+			Instruction instruction = handle.getInstruction();
+			if (instruction instanceof StoreInstruction){
+				int key = ((StoreInstruction) instruction).getIndex();
+				variableRefcount.put(key, 1);
+			}
+			else if (instruction instanceof LoadInstruction && !(instruction instanceof ALOAD) ){
+				int key = ((LoadInstruction) instruction).getIndex();
+				variableRefcount.put(key, variableRefcount.get(key) + 1);
+			}
+		}
+	}
+
+	public Method removeDeadCode(ClassGen cgen, ConstantPoolGen cpgen, Method method){
+		InstructionList il = new InstructionList(method.getCode().getCode());
+
+		MethodGen methodGen = new MethodGen(method.getAccessFlags(), method.getReturnType(), method.getArgumentTypes(), null, method.getName(), cgen.getClassName(), il, cpgen);
+
+		InstructionHandle[] handles = il.getInstructionHandles();
+
+		findLoopPositions(il);
+		//Count the number of times each variable is referenced
+		findVariableRefcounts(il);
+
+		//iterate through instructions and if refcount is 1 then pop previous two instructions.
+		for (InstructionHandle handle: handles){
+			Instruction instruction = handle.getInstruction();
+			if (instruction instanceof StoreInstruction){
+				int key = ((StoreInstruction) instruction).getIndex();
+				if (variableRefcount.get(key) == 1){
+					InstructionHandle prev = pushAndLoadInstructions.pop();
+					deleteInstruction(il,prev);
+					deleteInstruction(il,handle);
+				}
+			}
+			else if (isConstantLoadOrPushInstruction(instruction)) {
+				pushAndLoadInstructions.push(handle);
+			}
+			else{
+				continue;
+			}
+		}
+
+		methodGen.setMaxStack();
+		methodGen.setMaxLocals();
+		Method optimisedMethod = methodGen.getMethod();
+		return optimisedMethod;
 	}
 
 	public void optimiseArithmeticInstruction(InstructionList il, InstructionHandle handle, ConstantPoolGen cpgen)
